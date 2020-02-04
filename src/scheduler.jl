@@ -9,6 +9,35 @@ include("fault-handler.jl")
 
 const OneToMany = Dict{Thunk, Set{Thunk}}
 
+"A handle to the scheduler, used by dynamic thunks."
+struct SchedulerHandle
+    thunk_id::Int
+    chan::RemoteChannel
+end
+"Thrown when the scheduler halts before finishing processing the DAG."
+struct SchedulerHaltedException <: Exception end
+# Worker-side methods for dynamic communication
+send!(h::SchedulerHandle, cmd, data) = put!(h.chan, (h.thunk_id, cmd, data))
+halt!(h::SchedulerHandle) = send!(h, :halt, nothing)
+# Scheduler-side methods for dynamic communication
+recv!(h::SchedulerHandle) = take!(h.chan)
+function process_dynamic!(state, tid, cmd, data)
+    @warn "Received invalid dynamic command $cmd from thunk $tid: $data"
+    throw(SchedulerHaltedException())
+end
+process_dynamic!(state, tid, cmd::Val{:halt}, _) =
+    throw(SchedulerHaltedException())
+function process_dynamic!(state)
+    # TODO: Do this with tasks
+    for tid in keys(state.worker_chans)
+        chan = state.worker_chans[tid]
+        while isready(chan)
+            tid, cmd, data = take!(chan)
+            process_dynamic!(state, tid, Val(cmd), data)
+        end
+    end
+end
+
 """
     ComputeState
 
@@ -33,6 +62,7 @@ struct ComputeState
     cache::Dict{Thunk, Any}
     running::Set{Thunk}
     thunk_dict::Dict{Int, Any}
+    worker_chans::Dict{Int, RemoteChannel}
 end
 
 """
@@ -82,6 +112,10 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
 
     node_order = x -> -get(ord, x, 0)
     state = start_state(deps, node_order)
+    # setup worker-to-scheduler channels
+    for p in ps
+        state.worker_chans[p.pid] = fetch(@spawnat p.pid RemoteChannel(1))
+    end
     # start off some tasks
     for p in ps
         isempty(state.ready) && break
@@ -128,6 +162,9 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
         node = state.thunk_dict[thunk_id]
         @logmsg("WORKER $(proc.pid) - $node ($(node.f)) input:$(node.inputs)")
         state.cache[node] = res
+
+        # process dynamic communications
+        process_dynamic!(state)
 
         @dbg timespan_start(ctx, :scheduler, thunk_id, master)
         immediate_next = finish_task!(state, node, node_order)
@@ -247,7 +284,13 @@ function fire_task!(ctx, thunk, proc, state, chan, node_order)
     if thunk.options !== nothing && thunk.options.single > 0
         proc = OSProc(thunk.options.single)
     end
-    async_apply(ctx, proc, thunk.id, thunk.f, data, chan, thunk.get_result, thunk.persist, thunk.cache, thunk.options)
+    sch_handle = if thunk.dynamic
+        SchedulerHandle(thunk.id, state.worker_chans[proc.pid])
+    else
+        nothing
+    end
+    async_apply(ctx, proc, thunk.id, thunk.f, data, chan, thunk.get_result,
+                thunk.persist, thunk.cache, thunk.options, sch_handle)
 end
 
 function finish_task!(state, node, node_order; free=true)
@@ -294,7 +337,8 @@ function start_state(deps::Dict, node_order)
                   Vector{Thunk}(undef, 0),
                   Dict{Thunk, Any}(),
                   Set{Thunk}(),
-                  Dict{Int, Thunk}()
+                  Dict{Int, Thunk}(),
+                  Dict{Int, RemoteChannel}()
                  )
 
     nodes = sort(collect(keys(deps)), by=node_order)
@@ -316,12 +360,15 @@ end
 _move(ctx, to_proc, x) = x
 _move(ctx, to_proc::OSProc, x::Union{Chunk, Thunk}) = collect(ctx, x)
 
-@noinline function do_task(ctx, proc, thunk_id, f, data, send_result, persist, cache, options)
+@noinline function do_task(ctx, proc, thunk_id, f, data, send_result, persist, cache, options, sch_handle)
     @dbg timespan_start(ctx, :comm, thunk_id, proc)
     time_cost = @elapsed fetched = map(x->_move(ctx, proc, x), data)
     @dbg timespan_end(ctx, :comm, thunk_id, proc)
 
     @dbg timespan_start(ctx, :compute, thunk_id, proc)
+    if sch_handle !== nothing
+        fetched = (sch_handle, fetched...) # prepend scheduler handle
+    end
     result_meta = try
         use_threads = (ctx.options !== nothing && ctx.options.threads) ||
                       (options !== nothing && options.threads)
@@ -343,10 +390,12 @@ _move(ctx, to_proc::OSProc, x::Union{Chunk, Thunk}) = collect(ctx, x)
     result_meta
 end
 
-@noinline function async_apply(ctx, p::OSProc, thunk_id, f, data, chan, send_res, persist, cache, options)
+@noinline function async_apply(ctx, p::OSProc, thunk_id, f, data, chan, send_res, persist, cache, options, sch_handle)
     @async begin
         try
-            put!(chan, remotecall_fetch(do_task, p.pid, ctx, p, thunk_id, f, data, send_res, persist, cache, options))
+            put!(chan, remotecall_fetch(do_task, p.pid, ctx, p, thunk_id,
+                                        f, data, send_res, persist, cache,
+                                        options, sch_handle))
         catch ex
             bt = catch_backtrace()
             put!(chan, (p, thunk_id, CapturedException(ex, bt)))

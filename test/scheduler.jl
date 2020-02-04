@@ -1,9 +1,8 @@
-import Dagger.Sch: SchedulerOptions, ThunkOptions
+import Dagger.Sch: SchedulerOptions, ThunkOptions, SchedulerHaltedException
+import Dagger.Sch: halt!
 
-function inc(x)
-    x+1
-end
 @everywhere begin
+using Dagger
 function checkwid(x...)
     @assert myid() == 1
     return 1
@@ -11,6 +10,10 @@ end
 function checktid(x...)
     @assert Threads.threadid() != 1 || Threads.nthreads() == 1
     return 1
+end
+function dynamic_halt(h, x)
+    Dagger.Sch.halt!(h)
+    return x
 end
 end
 
@@ -47,5 +50,12 @@ end
 
             @test collect(Context(), a) == 1
         end
+    end
+end
+
+@testset "Dynamic Thunks" begin
+    @testset "Scheduler control" begin
+        a = delayed(dynamic_halt; dynamic=true)(1)
+        @test_throws SchedulerHaltedException collect(Context(), a)
     end
 end
