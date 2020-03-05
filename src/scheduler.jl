@@ -2,6 +2,7 @@ module Sch
 
 using Distributed
 import MemPool: DRef
+import UUIDs: UUID, uuid4
 
 import ..Dagger: Context, Thunk, Chunk, OSProc, order, free!, dependents, noffspring, istask, inputs, affinity, tochunk, @dbg, @logmsg, timespan_start, timespan_end, unrelease, procs
 
@@ -9,34 +10,8 @@ include("fault-handler.jl")
 
 const OneToMany = Dict{Thunk, Set{Thunk}}
 
-"A handle to the scheduler, used by dynamic thunks."
-struct SchedulerHandle
-    thunk_id::Int
-    chan::RemoteChannel
-end
-"Thrown when the scheduler halts before finishing processing the DAG."
-struct SchedulerHaltedException <: Exception end
-# Worker-side methods for dynamic communication
-send!(h::SchedulerHandle, cmd, data) = put!(h.chan, (h.thunk_id, cmd, data))
-halt!(h::SchedulerHandle) = send!(h, :halt, nothing)
-# Scheduler-side methods for dynamic communication
-recv!(h::SchedulerHandle) = take!(h.chan)
-function process_dynamic!(state, tid, cmd, data)
-    @warn "Received invalid dynamic command $cmd from thunk $tid: $data"
-    throw(SchedulerHaltedException())
-end
-process_dynamic!(state, tid, cmd::Val{:halt}, _) =
-    throw(SchedulerHaltedException())
-function process_dynamic!(state)
-    # TODO: Do this with tasks
-    for tid in keys(state.worker_chans)
-        chan = state.worker_chans[tid]
-        while isready(chan)
-            tid, cmd, data = take!(chan)
-            process_dynamic!(state, tid, Val(cmd), data)
-        end
-    end
-end
+# TODO: Split out API into separate file for other plugins
+include("dynamic.jl")
 
 """
     ComputeState
@@ -62,7 +37,7 @@ struct ComputeState
     cache::Dict{Thunk, Any}
     running::Set{Thunk}
     thunk_dict::Dict{Int, Any}
-    worker_chans::Dict{Int, RemoteChannel}
+    worker_chans::Dict{Int, Tuple{RC,RC} where RC<:RemoteChannel}
 end
 
 """
@@ -112,10 +87,16 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
 
     node_order = x -> -get(ord, x, 0)
     state = start_state(deps, node_order)
-    # setup worker-to-scheduler channels
+
+    # setup worker-to-scheduler channels and listener tasks
     for p in ps
-        state.worker_chans[p.pid] = fetch(@spawnat p.pid RemoteChannel(1))
+        in_chan = fetch(@spawnat p.pid RemoteChannel(1))
+        out_chan = RemoteChannel(p.pid)
+        state.worker_chans[p.pid] = (in_chan, out_chan)
+        remotecall_wait(listen_dynamic, p.pid, out_chan)
     end
+    process_dynamic!(state)
+
     # start off some tasks
     for p in ps
         isempty(state.ready) && break
@@ -162,9 +143,6 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
         node = state.thunk_dict[thunk_id]
         @logmsg("WORKER $(proc.pid) - $node ($(node.f)) input:$(node.inputs)")
         state.cache[node] = res
-
-        # process dynamic communications
-        process_dynamic!(state)
 
         @dbg timespan_start(ctx, :scheduler, thunk_id, master)
         immediate_next = finish_task!(state, node, node_order)
@@ -285,7 +263,7 @@ function fire_task!(ctx, thunk, proc, state, chan, node_order)
         proc = OSProc(thunk.options.single)
     end
     sch_handle = if thunk.dynamic
-        SchedulerHandle(thunk.id, state.worker_chans[proc.pid])
+        SchedulerHandle(thunk.id, state.worker_chans[proc.pid]...)
     else
         nothing
     end
@@ -338,7 +316,7 @@ function start_state(deps::Dict, node_order)
                   Dict{Thunk, Any}(),
                   Set{Thunk}(),
                   Dict{Int, Thunk}(),
-                  Dict{Int, RemoteChannel}()
+                  Dict{Int, Tuple{RC,RC} where RC<:RemoteChannel}()
                  )
 
     nodes = sort(collect(keys(deps)), by=node_order)

@@ -1,5 +1,5 @@
 import Dagger.Sch: SchedulerOptions, ThunkOptions, SchedulerHaltedException
-import Dagger.Sch: halt!
+import Dagger.Sch: halt!, exec!, getid, query_dag
 
 @everywhere begin
 using Dagger
@@ -14,6 +14,16 @@ end
 function dynamic_halt(h, x)
     Dagger.Sch.halt!(h)
     return x
+end
+function dynamic_exec(h, x)
+    return Dagger.Sch.exec!(h, :((y...)->40+2))
+end
+function dynamic_query_dag(h, x)
+    our_id = Dagger.Sch.getid(h)
+    results = Dagger.Sch.query_dag(h, [
+        (kern=our_id, query=:inputs),
+    ])
+    return results[our_id]
 end
 end
 
@@ -54,8 +64,17 @@ end
 end
 
 @testset "Dynamic Thunks" begin
-    @testset "Scheduler control" begin
+    @testset "Halt" begin
         a = delayed(dynamic_halt; dynamic=true)(1)
         @test_throws SchedulerHaltedException collect(Context(), a)
+    end
+    @testset "Exec" begin
+        a = delayed(dynamic_exec; dynamic=true)(1)
+        @test collect(Context(), a) == 42
+    end
+    @testset "Query DAG" begin
+        a = delayed(dynamic_query_dag; dynamic=true)(1)
+        result = collect(Context(), a)
+        @test length(result.inputs) == 1
     end
 end
